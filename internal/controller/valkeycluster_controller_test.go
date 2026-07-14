@@ -120,6 +120,52 @@ var _ = Describe("ValkeyCluster Controller", func() {
 	})
 })
 
+var _ = Describe("ValkeyCluster deletion", func() {
+	ctx := context.Background()
+
+	It("does not recreate owned resources while the cluster is terminating", func() {
+		cluster := &valkeyiov1alpha1.ValkeyCluster{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:       "terminating-cluster",
+				Namespace:  "default",
+				Finalizers: []string{"test.valkey.io/hold-deletion"},
+			},
+			Spec: valkeyiov1alpha1.ValkeyClusterSpec{
+				Shards:   1,
+				Replicas: 0,
+			},
+		}
+		Expect(k8sClient.Create(ctx, cluster)).To(Succeed())
+		Expect(k8sClient.Delete(ctx, cluster)).To(Succeed())
+
+		terminating := &valkeyiov1alpha1.ValkeyCluster{}
+		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(cluster), terminating)).To(Succeed())
+		Expect(terminating.DeletionTimestamp.IsZero()).To(BeFalse())
+
+		r := &ValkeyClusterReconciler{
+			Client:    k8sClient,
+			APIReader: k8sClient,
+			Scheme:    k8sClient.Scheme(),
+			Recorder:  events.NewFakeRecorder(100),
+		}
+		result, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(cluster)})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(result).To(Equal(reconcile.Result{}))
+
+		nodes := &valkeyiov1alpha1.ValkeyNodeList{}
+		Expect(k8sClient.List(ctx, nodes, client.InNamespace(cluster.Namespace), client.MatchingLabels{LabelCluster: cluster.Name})).To(Succeed())
+		Expect(nodes.Items).To(BeEmpty())
+
+		service := &corev1.Service{}
+		Expect(k8sClient.Get(ctx, client.ObjectKey{Name: headlessServiceName(cluster.Name), Namespace: cluster.Namespace}, service)).To(Satisfy(errors.IsNotFound))
+		configMap := &corev1.ConfigMap{}
+		Expect(k8sClient.Get(ctx, client.ObjectKey{Name: GetServerConfigMapName(cluster.Name), Namespace: cluster.Namespace}, configMap)).To(Satisfy(errors.IsNotFound))
+
+		terminating.Finalizers = nil
+		Expect(k8sClient.Update(ctx, terminating)).To(Succeed())
+	})
+})
+
 var _ = Describe("ValkeyCluster config hash propagation", func() {
 	ctx := context.Background()
 

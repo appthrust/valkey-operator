@@ -121,6 +121,10 @@ func (r *ValkeyClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		}
 		return ctrl.Result{}, err
 	}
+	if !cluster.DeletionTimestamp.IsZero() {
+		deleteClusterMetrics(req.Name, req.Namespace)
+		return ctrl.Result{}, nil
+	}
 
 	initClusterMetrics(req.Name, req.Namespace)
 
