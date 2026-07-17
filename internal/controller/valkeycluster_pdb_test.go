@@ -50,8 +50,9 @@ var _ = Describe("reconcilePodDisruptionBudget", func() {
 		}
 		cluster = &valkeyiov1alpha1.ValkeyCluster{
 			ObjectMeta: metav1.ObjectMeta{
-				Name:      "pdb-test-cluster",
-				Namespace: "default",
+				Name:       "pdb-test-cluster",
+				Namespace:  "default",
+				Finalizers: []string{valkeyClusterFinalizer},
 			},
 			Spec: valkeyiov1alpha1.ValkeyClusterSpec{
 				Shards:   1,
