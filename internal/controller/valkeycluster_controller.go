@@ -56,6 +56,7 @@ const (
 	statusUpdateFailedMsg = "failed to update status"
 
 	valkeyClusterFinalizer = "valkey.io/ordered-cleanup"
+	valkeyClusterKind      = "ValkeyCluster"
 )
 
 // ValkeyClusterReconciler reconciles a ValkeyCluster object
@@ -135,7 +136,7 @@ func (r *ValkeyClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		if err := r.Update(ctx, cluster); err != nil {
 			return ctrl.Result{}, err
 		}
-		return ctrl.Result{Requeue: true}, nil
+		return ctrl.Result{RequeueAfter: time.Second}, nil
 	}
 
 	initClusterMetrics(req.Name, req.Namespace)
@@ -444,7 +445,7 @@ func (r *ValkeyClusterReconciler) finalizeValkeyCluster(ctx context.Context, clu
 				}
 			}
 		}
-		return ctrl.Result{Requeue: true}, nil
+		return ctrl.Result{RequeueAfter: time.Second}, nil
 	}
 
 	secretNames := sharedSecretNames(cluster.Name)
@@ -459,7 +460,7 @@ func (r *ValkeyClusterReconciler) finalizeValkeyCluster(ctx context.Context, clu
 		secret := &corev1.Secret{}
 		err := reader.Get(ctx, client.ObjectKey{Name: name, Namespace: cluster.Namespace}, secret)
 		if err == nil {
-			return ctrl.Result{Requeue: true}, nil
+			return ctrl.Result{RequeueAfter: time.Second}, nil
 		}
 		if !apierrors.IsNotFound(err) {
 			return ctrl.Result{}, err
@@ -520,7 +521,7 @@ func sharedSecretNames(clusterName string) []string {
 
 func isControlledByValkeyCluster(node *valkeyiov1alpha1.ValkeyNode, cluster *valkeyiov1alpha1.ValkeyCluster) bool {
 	for _, owner := range node.OwnerReferences {
-		if owner.Controller != nil && *owner.Controller && owner.UID == cluster.UID && owner.APIVersion == valkeyiov1alpha1.GroupVersion.String() && owner.Kind == "ValkeyCluster" && owner.Name == cluster.Name {
+		if owner.Controller != nil && *owner.Controller && owner.UID == cluster.UID && owner.APIVersion == valkeyiov1alpha1.GroupVersion.String() && owner.Kind == valkeyClusterKind && owner.Name == cluster.Name {
 			return true
 		}
 	}

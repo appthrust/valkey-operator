@@ -162,7 +162,7 @@ var _ = Describe("ValkeyCluster ordered finalization", func() {
 
 		result, err := newReconciler().Reconcile(ctx, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(cluster)})
 		Expect(err).NotTo(HaveOccurred())
-		Expect(result.Requeue).To(BeTrue())
+		Expect(result.RequeueAfter).To(BeNumerically(">", 0))
 
 		current := &valkeyiov1alpha1.ValkeyCluster{}
 		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(cluster), current)).To(Succeed())
@@ -229,7 +229,7 @@ var _ = Describe("ValkeyCluster ordered finalization", func() {
 		By("deleting ValkeyNodes while preserving both shared Secrets")
 		result, err := r.Reconcile(ctx, request)
 		Expect(err).NotTo(HaveOccurred())
-		Expect(result.Requeue).To(BeTrue())
+		Expect(result.RequeueAfter).To(BeNumerically(">", 0))
 		currentNode := &valkeyiov1alpha1.ValkeyNode{}
 		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(node), currentNode)).To(Succeed())
 		Expect(currentNode.DeletionTimestamp.IsZero()).To(BeFalse())
@@ -243,7 +243,7 @@ var _ = Describe("ValkeyCluster ordered finalization", func() {
 		By("continuing to preserve Secrets while a terminating ValkeyNode exists")
 		result, err = r.Reconcile(ctx, request)
 		Expect(err).NotTo(HaveOccurred())
-		Expect(result.Requeue).To(BeTrue())
+		Expect(result.RequeueAfter).To(BeNumerically(">", 0))
 		Expect(k8sClient.Get(ctx, client.ObjectKey{Name: getInternalSecretName(cluster.Name), Namespace: cluster.Namespace}, &corev1.Secret{})).To(Succeed())
 
 		By("allowing the ValkeyNode to finish, then requesting Secret deletion")
@@ -254,7 +254,7 @@ var _ = Describe("ValkeyCluster ordered finalization", func() {
 		}).Should(BeTrue())
 		result, err = r.Reconcile(ctx, request)
 		Expect(err).NotTo(HaveOccurred())
-		Expect(result.Requeue).To(BeTrue())
+		Expect(result.RequeueAfter).To(BeNumerically(">", 0))
 
 		terminatingCluster := &valkeyiov1alpha1.ValkeyCluster{}
 		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(cluster), terminatingCluster)).To(Succeed())
@@ -283,7 +283,7 @@ var _ = Describe("ValkeyCluster ordered finalization", func() {
 		r.APIReader = &staleObjectReader{Reader: k8sClient, object: staleSecret}
 		result, err = r.Reconcile(ctx, request)
 		Expect(err).NotTo(HaveOccurred())
-		Expect(result.Requeue).To(BeTrue())
+		Expect(result.RequeueAfter).To(BeNumerically(">", 0))
 		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(cluster), &valkeyiov1alpha1.ValkeyCluster{})).To(Succeed())
 
 		r.APIReader = k8sClient

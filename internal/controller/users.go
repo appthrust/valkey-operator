@@ -504,7 +504,7 @@ func removeClusterOwnerReference(secret *corev1.Secret, cluster *valkeyiov1alpha
 	owners := secret.GetOwnerReferences()
 	filtered := owners[:0]
 	for _, owner := range owners {
-		if owner.UID == cluster.UID || (owner.APIVersion == valkeyiov1alpha1.GroupVersion.String() && owner.Kind == "ValkeyCluster" && owner.Name == cluster.Name) {
+		if owner.UID == cluster.UID || (owner.APIVersion == valkeyiov1alpha1.GroupVersion.String() && owner.Kind == valkeyClusterKind && owner.Name == cluster.Name) {
 			continue
 		}
 		filtered = append(filtered, owner)
@@ -518,7 +518,7 @@ func removeClusterOwnerReference(secret *corev1.Secret, cluster *valkeyiov1alpha
 
 func hasValkeyClusterOwnerReference(secret *corev1.Secret, cluster *valkeyiov1alpha1.ValkeyCluster) bool {
 	for _, owner := range secret.OwnerReferences {
-		if owner.UID == cluster.UID || (owner.APIVersion == valkeyiov1alpha1.GroupVersion.String() && owner.Kind == "ValkeyCluster" && owner.Name == cluster.Name) {
+		if owner.UID == cluster.UID || (owner.APIVersion == valkeyiov1alpha1.GroupVersion.String() && owner.Kind == valkeyClusterKind && owner.Name == cluster.Name) {
 			return true
 		}
 	}
