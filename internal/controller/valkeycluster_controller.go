@@ -54,6 +54,9 @@ const (
 
 	// Error messages
 	statusUpdateFailedMsg = "failed to update status"
+
+	valkeyClusterFinalizer = "valkey.io/ordered-cleanup"
+	valkeyClusterKind      = "ValkeyCluster"
 )
 
 // ValkeyClusterReconciler reconciles a ValkeyCluster object
@@ -120,6 +123,20 @@ func (r *ValkeyClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 			return ctrl.Result{}, nil
 		}
 		return ctrl.Result{}, err
+	}
+	if !cluster.DeletionTimestamp.IsZero() {
+		deleteClusterMetrics(req.Name, req.Namespace)
+		return r.finalizeValkeyCluster(ctx, cluster)
+	}
+	if !controllerutil.ContainsFinalizer(cluster, valkeyClusterFinalizer) {
+		if err := r.migrateSharedSecretOwnership(ctx, cluster); err != nil {
+			return ctrl.Result{}, err
+		}
+		controllerutil.AddFinalizer(cluster, valkeyClusterFinalizer)
+		if err := r.Update(ctx, cluster); err != nil {
+			return ctrl.Result{}, err
+		}
+		return ctrl.Result{RequeueAfter: time.Second}, nil
 	}
 
 	initClusterMetrics(req.Name, req.Namespace)
@@ -399,6 +416,116 @@ func (r *ValkeyClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 
 	log.V(1).Info("reconcile done")
 	return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+}
+
+// finalizeValkeyCluster keeps shared credentials available until every
+// ValkeyNode has completed its own dependent cleanup.
+func (r *ValkeyClusterReconciler) finalizeValkeyCluster(ctx context.Context, cluster *valkeyiov1alpha1.ValkeyCluster) (ctrl.Result, error) {
+	if !controllerutil.ContainsFinalizer(cluster, valkeyClusterFinalizer) {
+		return ctrl.Result{}, nil
+	}
+
+	reader := r.uncachedReader()
+	allNodes := &valkeyiov1alpha1.ValkeyNodeList{}
+	if err := reader.List(ctx, allNodes, client.InNamespace(cluster.Namespace)); err != nil {
+		return ctrl.Result{}, err
+	}
+	nodes := make([]*valkeyiov1alpha1.ValkeyNode, 0, len(allNodes.Items))
+	for i := range allNodes.Items {
+		if isControlledByValkeyCluster(&allNodes.Items[i], cluster) {
+			nodes = append(nodes, &allNodes.Items[i])
+		}
+	}
+	if len(nodes) > 0 {
+		foreground := metav1.DeletePropagationForeground
+		for _, node := range nodes {
+			if node.DeletionTimestamp.IsZero() {
+				if err := r.Delete(ctx, node, &client.DeleteOptions{PropagationPolicy: &foreground}); err != nil && !apierrors.IsNotFound(err) {
+					return ctrl.Result{}, err
+				}
+			}
+		}
+		return ctrl.Result{RequeueAfter: time.Second}, nil
+	}
+
+	secretNames := sharedSecretNames(cluster.Name)
+	for _, name := range secretNames {
+		secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: cluster.Namespace}}
+		if err := r.Delete(ctx, secret); err != nil && !apierrors.IsNotFound(err) {
+			return ctrl.Result{}, err
+		}
+	}
+
+	for _, name := range secretNames {
+		secret := &corev1.Secret{}
+		err := reader.Get(ctx, client.ObjectKey{Name: name, Namespace: cluster.Namespace}, secret)
+		if err == nil {
+			return ctrl.Result{RequeueAfter: time.Second}, nil
+		}
+		if !apierrors.IsNotFound(err) {
+			return ctrl.Result{}, err
+		}
+	}
+
+	controllerutil.RemoveFinalizer(cluster, valkeyClusterFinalizer)
+	if err := r.Update(ctx, cluster); err != nil {
+		return ctrl.Result{}, err
+	}
+	return ctrl.Result{}, nil
+}
+
+func (r *ValkeyClusterReconciler) migrateSharedSecretOwnership(ctx context.Context, cluster *valkeyiov1alpha1.ValkeyCluster) error {
+	reader := r.uncachedReader()
+	for _, name := range sharedSecretNames(cluster.Name) {
+		secret := &corev1.Secret{}
+		key := client.ObjectKey{Name: name, Namespace: cluster.Namespace}
+		if err := reader.Get(ctx, key, secret); err != nil {
+			if apierrors.IsNotFound(err) {
+				continue
+			}
+			return err
+		}
+		if removeClusterOwnerReference(secret, cluster) {
+			if err := r.Update(ctx, secret); err != nil {
+				return err
+			}
+		}
+	}
+
+	for _, name := range sharedSecretNames(cluster.Name) {
+		secret := &corev1.Secret{}
+		err := reader.Get(ctx, client.ObjectKey{Name: name, Namespace: cluster.Namespace}, secret)
+		if apierrors.IsNotFound(err) {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		if hasValkeyClusterOwnerReference(secret, cluster) {
+			return fmt.Errorf("shared Secret %s/%s still has ValkeyCluster owner reference", cluster.Namespace, name)
+		}
+	}
+	return nil
+}
+
+func (r *ValkeyClusterReconciler) uncachedReader() client.Reader {
+	if r.APIReader != nil {
+		return r.APIReader
+	}
+	return r.Client
+}
+
+func sharedSecretNames(clusterName string) []string {
+	return []string{getInternalSecretName(clusterName), getSystemPasswordSecretName(clusterName)}
+}
+
+func isControlledByValkeyCluster(node *valkeyiov1alpha1.ValkeyNode, cluster *valkeyiov1alpha1.ValkeyCluster) bool {
+	for _, owner := range node.OwnerReferences {
+		if owner.Controller != nil && *owner.Controller && owner.UID == cluster.UID && owner.APIVersion == valkeyiov1alpha1.GroupVersion.String() && owner.Kind == valkeyClusterKind && owner.Name == cluster.Name {
+			return true
+		}
+	}
+	return false
 }
 
 type podSchedulingIssue struct {

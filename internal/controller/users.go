@@ -31,7 +31,6 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 	valkeyiov1alpha1 "valkey.io/valkey-operator/api/v1alpha1"
 )
@@ -405,14 +404,9 @@ func (r *ValkeyClusterReconciler) upsertSystemUsersPasswordSecret(ctx context.Co
 			Labels:    labels(cluster),
 		}
 		systemUsersSecret.Data = make(map[string][]byte)
-		// Register ownership of the new internal Secret
-		if err := controllerutil.SetControllerReference(cluster, systemUsersSecret, r.Scheme); err != nil {
-			log.Error(err, "Failed to grab ownership of system users secret")
-			r.Recorder.Eventf(cluster, nil, corev1.EventTypeWarning, "InternalSecretsCreationFailed", "ReconcileUsers", "Failed to grab ownership of system users secret: %v", err)
-			return systemUsersSecret, err
-		}
 		createSecret = true
 	}
+	removeClusterOwnerReference(systemUsersSecret, cluster)
 
 	for _, user := range systemUsers {
 		if _, alreadyExist := systemUsersSecret.Data[user]; alreadyExist {
@@ -471,13 +465,6 @@ func (r *ValkeyClusterReconciler) upsertInternalAclSecret(ctx context.Context, c
 		}
 		internalAclSecret.Type = AclSecretType
 
-		// Register ownership of the new internal Secret
-		if err := controllerutil.SetControllerReference(cluster, internalAclSecret, r.Scheme); err != nil {
-			log.Error(err, "Failed to grab ownership of internal secret")
-			r.Recorder.Eventf(cluster, nil, corev1.EventTypeWarning, "InternalSecretsCreationFailed", "ReconcileUsers", "Failed to grab ownership of internal secret: %v", err)
-			return err
-		}
-
 		// Create the internal Secret
 		if err := r.Create(ctx, internalAclSecret); err != nil {
 			log.Error(err, "Failed to create internal secret")
@@ -494,7 +481,8 @@ func (r *ValkeyClusterReconciler) upsertInternalAclSecret(ctx context.Context, c
 	// determine if anything needs updating. If the hashes are the
 	// same, don't update as that would cause infinite reconciliation
 
-	if !upsertAnnotation(internalAclSecret, hashAnnotationKey, aclHash) {
+	ownerReferenceRemoved := removeClusterOwnerReference(internalAclSecret, cluster)
+	if !upsertAnnotation(internalAclSecret, hashAnnotationKey, aclHash) && !ownerReferenceRemoved {
 		log.V(1).Info("internal ACLs unchanged")
 		return nil
 	}
@@ -510,4 +498,29 @@ func (r *ValkeyClusterReconciler) upsertInternalAclSecret(ctx context.Context, c
 
 	r.Recorder.Eventf(cluster, nil, corev1.EventTypeNormal, "InternalSecretsUpdated", "ReconcileUsers", "Synchronized internal ACLs")
 	return nil
+}
+
+func removeClusterOwnerReference(secret *corev1.Secret, cluster *valkeyiov1alpha1.ValkeyCluster) bool {
+	owners := secret.GetOwnerReferences()
+	filtered := owners[:0]
+	for _, owner := range owners {
+		if owner.UID == cluster.UID || (owner.APIVersion == valkeyiov1alpha1.GroupVersion.String() && owner.Kind == valkeyClusterKind && owner.Name == cluster.Name) {
+			continue
+		}
+		filtered = append(filtered, owner)
+	}
+	if len(filtered) == len(owners) {
+		return false
+	}
+	secret.SetOwnerReferences(filtered)
+	return true
+}
+
+func hasValkeyClusterOwnerReference(secret *corev1.Secret, cluster *valkeyiov1alpha1.ValkeyCluster) bool {
+	for _, owner := range secret.OwnerReferences {
+		if owner.UID == cluster.UID || (owner.APIVersion == valkeyiov1alpha1.GroupVersion.String() && owner.Kind == valkeyClusterKind && owner.Name == cluster.Name) {
+			return true
+		}
+	}
+	return false
 }

@@ -1402,7 +1402,7 @@ spec:
 	})
 
 	Context("single-node cluster scale-up", func() {
-		const clusterName = "valkeycluster-scaleup-e2e"
+		var clusterName string
 
 		AfterEach(func() {
 			cmd := exec.Command("kubectl", "delete", "valkeycluster", clusterName, "--ignore-not-found=true", "--wait=false")
@@ -1410,6 +1410,7 @@ spec:
 		})
 
 		It("scales from 1 shard 0 replicas to 1 shard 1 replica", func() {
+			clusterName = "valkeycluster-replica-scaleup-e2e"
 			By("creating a single-node cluster")
 			manifest := fmt.Sprintf(`apiVersion: valkey.io/v1alpha1
 kind: ValkeyCluster
@@ -1459,6 +1460,7 @@ spec:
 		})
 
 		It("scales from 1 shard 0 replicas to 2 shards 0 replicas", func() {
+			clusterName = "valkeycluster-shard-scaleup-e2e"
 			By("creating a single-node cluster")
 			manifest := fmt.Sprintf(`apiVersion: valkey.io/v1alpha1
 kind: ValkeyCluster

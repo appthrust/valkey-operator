@@ -1,0 +1,5 @@
+# Keep this in the CRD-free undeploy root so kustomize load restrictions do
+# not couple controller cleanup to config/default.
+- op: add
+  path: /spec/template/spec/containers/0/args/0
+  value: --metrics-bind-address=:8443

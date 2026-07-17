@@ -26,7 +26,8 @@ type UserAclSpec struct {
 
 	// If the user is enabled or not
 	// +kubebuilder:default=true
-	Enabled bool `json:"enabled,omitempty"`
+	// +optional
+	Enabled bool `json:"enabled"`
 
 	// Reference information to a Secret containing user passwords
 	// +optional

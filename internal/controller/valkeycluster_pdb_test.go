@@ -27,6 +27,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/client-go/tools/events"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	valkeyiov1alpha1 "valkey.io/valkey-operator/api/v1alpha1"
@@ -49,8 +50,9 @@ var _ = Describe("reconcilePodDisruptionBudget", func() {
 		}
 		cluster = &valkeyiov1alpha1.ValkeyCluster{
 			ObjectMeta: metav1.ObjectMeta{
-				Name:      "pdb-test-cluster",
-				Namespace: "default",
+				Name:       "pdb-test-cluster",
+				Namespace:  "default",
+				Finalizers: []string{valkeyClusterFinalizer},
 			},
 			Spec: valkeyiov1alpha1.ValkeyClusterSpec{
 				Shards:   1,
@@ -61,7 +63,12 @@ var _ = Describe("reconcilePodDisruptionBudget", func() {
 		pdbKey = types.NamespacedName{Name: pdbName(cluster), Namespace: cluster.Namespace}
 
 		DeferCleanup(func() {
-			_ = k8sClient.Delete(ctx, cluster)
+			current := &valkeyiov1alpha1.ValkeyCluster{}
+			if err := k8sClient.Get(ctx, types.NamespacedName{Name: cluster.Name, Namespace: cluster.Namespace}, current); err == nil {
+				controllerutil.RemoveFinalizer(current, valkeyClusterFinalizer)
+				_ = k8sClient.Update(ctx, current)
+				_ = k8sClient.Delete(ctx, current)
+			}
 			pdb := &policyv1.PodDisruptionBudget{}
 			if err := k8sClient.Get(ctx, pdbKey, pdb); err == nil {
 				_ = k8sClient.Delete(ctx, pdb)
