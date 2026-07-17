@@ -22,8 +22,36 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	valkeyiov1alpha1 "valkey.io/valkey-operator/api/v1alpha1"
 )
+
+func TestRemoveClusterOwnerReference(t *testing.T) {
+	controller := true
+	cluster := &valkeyiov1alpha1.ValkeyCluster{ObjectMeta: metav1.ObjectMeta{Name: "c1", UID: types.UID("cluster-uid")}}
+	secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{OwnerReferences: []metav1.OwnerReference{
+		{APIVersion: valkeyiov1alpha1.GroupVersion.String(), Kind: "ValkeyCluster", Name: cluster.Name, UID: cluster.UID, Controller: &controller},
+		{APIVersion: "example.io/v1", Kind: "ExternalOwner", Name: "keep", UID: types.UID("other-uid")},
+	}}}
+
+	assert.True(t, removeClusterOwnerReference(secret, cluster))
+	assert.Equal(t, []metav1.OwnerReference{{APIVersion: "example.io/v1", Kind: "ExternalOwner", Name: "keep", UID: types.UID("other-uid")}}, secret.OwnerReferences)
+	assert.False(t, removeClusterOwnerReference(secret, cluster))
+}
+
+func TestIsControlledByValkeyCluster(t *testing.T) {
+	controller := true
+	cluster := &valkeyiov1alpha1.ValkeyCluster{ObjectMeta: metav1.ObjectMeta{Name: "c1", UID: types.UID("cluster-uid")}}
+	ownedWithoutLabel := &valkeyiov1alpha1.ValkeyNode{ObjectMeta: metav1.ObjectMeta{OwnerReferences: []metav1.OwnerReference{{
+		APIVersion: valkeyiov1alpha1.GroupVersion.String(), Kind: "ValkeyCluster", Name: cluster.Name, UID: cluster.UID, Controller: &controller,
+	}}}}
+	foreignWithLabel := &valkeyiov1alpha1.ValkeyNode{ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{LabelCluster: cluster.Name}}}
+
+	assert.True(t, isControlledByValkeyCluster(ownedWithoutLabel, cluster))
+	assert.False(t, isControlledByValkeyCluster(foreignWithLabel, cluster))
+}
 
 func TestOperatorUserPasswordSecret(t *testing.T) {
 	sel := operatorUserPasswordSecret("c1")

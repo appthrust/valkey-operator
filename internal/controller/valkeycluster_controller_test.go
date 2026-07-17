@@ -30,6 +30,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/events"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	corev1 "k8s.io/api/core/v1"
@@ -38,6 +39,18 @@ import (
 	valkeyiov1alpha1 "valkey.io/valkey-operator/api/v1alpha1"
 	testutils "valkey.io/valkey-operator/test/utils"
 )
+
+type staleObjectReader struct {
+	client.Reader
+	object client.Object
+}
+
+func (r *staleObjectReader) Get(ctx context.Context, key client.ObjectKey, object client.Object, opts ...client.GetOption) error {
+	if r.object != nil && key == client.ObjectKeyFromObject(r.object) {
+		return nil
+	}
+	return r.Reader.Get(ctx, key, object, opts...)
+}
 
 var _ = Describe("ValkeyCluster Controller", func() {
 	Context("When reconciling a resource", func() {
@@ -92,6 +105,8 @@ var _ = Describe("ValkeyCluster Controller", func() {
 				NamespacedName: typeNamespacedName,
 			})
 			Expect(err).NotTo(HaveOccurred())
+			_, err = controllerReconciler.Reconcile(ctx, reconcile.Request{NamespacedName: typeNamespacedName})
+			Expect(err).NotTo(HaveOccurred())
 
 			// Check status conditions
 			updatedValkeyCluster := &valkeyiov1alpha1.ValkeyCluster{}
@@ -117,6 +132,166 @@ var _ = Describe("ValkeyCluster Controller", func() {
 			Expect(events).To(ContainElement(ContainSubstring("ValkeyNodeCreated")))
 
 		})
+	})
+})
+
+var _ = Describe("ValkeyCluster ordered finalization", func() {
+	ctx := context.Background()
+
+	newReconciler := func() *ValkeyClusterReconciler {
+		return &ValkeyClusterReconciler{
+			Client:    k8sClient,
+			APIReader: k8sClient,
+			Scheme:    k8sClient.Scheme(),
+			Recorder:  events.NewFakeRecorder(100),
+		}
+	}
+
+	It("removes legacy Secret ownership before inserting the finalizer", func() {
+		cluster := &valkeyiov1alpha1.ValkeyCluster{
+			ObjectMeta: metav1.ObjectMeta{Name: "finalizer-insertion", Namespace: "default"},
+			Spec:       valkeyiov1alpha1.ValkeyClusterSpec{Shards: 1, Replicas: 0},
+		}
+		Expect(k8sClient.Create(ctx, cluster)).To(Succeed())
+		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(cluster), cluster)).To(Succeed())
+		for _, name := range sharedSecretNames(cluster.Name) {
+			secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: cluster.Namespace}}
+			Expect(controllerutil.SetControllerReference(cluster, secret, k8sClient.Scheme())).To(Succeed())
+			Expect(k8sClient.Create(ctx, secret)).To(Succeed())
+		}
+
+		result, err := newReconciler().Reconcile(ctx, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(cluster)})
+		Expect(err).NotTo(HaveOccurred())
+		Expect(result.Requeue).To(BeTrue())
+
+		current := &valkeyiov1alpha1.ValkeyCluster{}
+		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(cluster), current)).To(Succeed())
+		Expect(current.Finalizers).To(ContainElement(valkeyClusterFinalizer))
+		for _, name := range sharedSecretNames(cluster.Name) {
+			secret := &corev1.Secret{}
+			Expect(k8sClient.Get(ctx, client.ObjectKey{Name: name, Namespace: cluster.Namespace}, secret)).To(Succeed())
+			Expect(secret.OwnerReferences).To(BeEmpty())
+		}
+
+		By("preserving migrated credentials when deletion begins immediately")
+		Expect(k8sClient.Delete(ctx, current)).To(Succeed())
+		for _, name := range sharedSecretNames(cluster.Name) {
+			Expect(k8sClient.Get(ctx, client.ObjectKey{Name: name, Namespace: cluster.Namespace}, &corev1.Secret{})).To(Succeed())
+		}
+
+		_, err = newReconciler().Reconcile(ctx, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(cluster)})
+		Expect(err).NotTo(HaveOccurred())
+	})
+
+	It("preserves shared Secrets until nodes are absent and removes its finalizer only after Secrets are absent", func() {
+		const holdFinalizer = "test.valkey.io/hold"
+		cluster := &valkeyiov1alpha1.ValkeyCluster{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:       "ordered-deletion",
+				Namespace:  "default",
+				Finalizers: []string{valkeyClusterFinalizer},
+			},
+			Spec: valkeyiov1alpha1.ValkeyClusterSpec{Shards: 1, Replicas: 0},
+		}
+		Expect(k8sClient.Create(ctx, cluster)).To(Succeed())
+
+		controller := true
+		node := &valkeyiov1alpha1.ValkeyNode{ObjectMeta: metav1.ObjectMeta{
+			Name:       "ordered-deletion-0-0",
+			Namespace:  cluster.Namespace,
+			Finalizers: []string{holdFinalizer},
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: valkeyiov1alpha1.GroupVersion.String(), Kind: "ValkeyCluster", Name: cluster.Name, UID: cluster.UID, Controller: &controller,
+			}},
+		}}
+		Expect(k8sClient.Create(ctx, node)).To(Succeed())
+		foreignNode := &valkeyiov1alpha1.ValkeyNode{ObjectMeta: metav1.ObjectMeta{
+			Name: "foreign-same-label", Namespace: cluster.Namespace,
+			Labels: map[string]string{LabelCluster: cluster.Name},
+		}}
+		Expect(k8sClient.Create(ctx, foreignNode)).To(Succeed())
+		defer func() { _ = k8sClient.Delete(ctx, foreignNode) }()
+
+		for _, name := range []string{getInternalSecretName(cluster.Name), getSystemPasswordSecretName(cluster.Name)} {
+			secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{
+				Name:       name,
+				Namespace:  cluster.Namespace,
+				Labels:     map[string]string{LabelCluster: cluster.Name},
+				Finalizers: []string{holdFinalizer},
+			}}
+			Expect(k8sClient.Create(ctx, secret)).To(Succeed())
+		}
+
+		Expect(k8sClient.Delete(ctx, cluster)).To(Succeed())
+		r := newReconciler()
+		request := reconcile.Request{NamespacedName: client.ObjectKeyFromObject(cluster)}
+
+		By("deleting ValkeyNodes while preserving both shared Secrets")
+		result, err := r.Reconcile(ctx, request)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(result.Requeue).To(BeTrue())
+		currentNode := &valkeyiov1alpha1.ValkeyNode{}
+		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(node), currentNode)).To(Succeed())
+		Expect(currentNode.DeletionTimestamp.IsZero()).To(BeFalse())
+		foreignCurrent := &valkeyiov1alpha1.ValkeyNode{}
+		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(foreignNode), foreignCurrent)).To(Succeed())
+		Expect(foreignCurrent.DeletionTimestamp.IsZero()).To(BeTrue())
+		for _, name := range []string{getInternalSecretName(cluster.Name), getSystemPasswordSecretName(cluster.Name)} {
+			Expect(k8sClient.Get(ctx, client.ObjectKey{Name: name, Namespace: cluster.Namespace}, &corev1.Secret{})).To(Succeed())
+		}
+
+		By("continuing to preserve Secrets while a terminating ValkeyNode exists")
+		result, err = r.Reconcile(ctx, request)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(result.Requeue).To(BeTrue())
+		Expect(k8sClient.Get(ctx, client.ObjectKey{Name: getInternalSecretName(cluster.Name), Namespace: cluster.Namespace}, &corev1.Secret{})).To(Succeed())
+
+		By("allowing the ValkeyNode to finish, then requesting Secret deletion")
+		currentNode.Finalizers = nil
+		Expect(k8sClient.Update(ctx, currentNode)).To(Succeed())
+		Eventually(func() bool {
+			return errors.IsNotFound(k8sClient.Get(ctx, client.ObjectKeyFromObject(node), &valkeyiov1alpha1.ValkeyNode{}))
+		}).Should(BeTrue())
+		result, err = r.Reconcile(ctx, request)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(result.Requeue).To(BeTrue())
+
+		terminatingCluster := &valkeyiov1alpha1.ValkeyCluster{}
+		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(cluster), terminatingCluster)).To(Succeed())
+		Expect(terminatingCluster.Finalizers).To(ContainElement(valkeyClusterFinalizer))
+
+		By("allowing Secret deletion and removing the cluster finalizer only after both are absent")
+		for _, name := range []string{getInternalSecretName(cluster.Name), getSystemPasswordSecretName(cluster.Name)} {
+			secret := &corev1.Secret{}
+			Expect(k8sClient.Get(ctx, client.ObjectKey{Name: name, Namespace: cluster.Namespace}, secret)).To(Succeed())
+			Expect(secret.DeletionTimestamp.IsZero()).To(BeFalse())
+			secret.Finalizers = nil
+			Expect(k8sClient.Update(ctx, secret)).To(Succeed())
+		}
+		Eventually(func() bool {
+			for _, name := range []string{getInternalSecretName(cluster.Name), getSystemPasswordSecretName(cluster.Name)} {
+				if !errors.IsNotFound(k8sClient.Get(ctx, client.ObjectKey{Name: name, Namespace: cluster.Namespace}, &corev1.Secret{})) {
+					return false
+				}
+			}
+			return true
+		}).Should(BeTrue())
+
+		staleSecret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{
+			Name: getInternalSecretName(cluster.Name), Namespace: cluster.Namespace,
+		}}
+		r.APIReader = &staleObjectReader{Reader: k8sClient, object: staleSecret}
+		result, err = r.Reconcile(ctx, request)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(result.Requeue).To(BeTrue())
+		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(cluster), &valkeyiov1alpha1.ValkeyCluster{})).To(Succeed())
+
+		r.APIReader = k8sClient
+		_, err = r.Reconcile(ctx, request)
+		Expect(err).NotTo(HaveOccurred())
+		Eventually(func() bool {
+			return errors.IsNotFound(k8sClient.Get(ctx, client.ObjectKeyFromObject(cluster), &valkeyiov1alpha1.ValkeyCluster{}))
+		}).Should(BeTrue())
 	})
 })
 
@@ -162,6 +337,8 @@ var _ = Describe("ValkeyCluster config hash propagation", func() {
 
 		By("reconciling to create the ConfigMap and ValkeyNodes")
 		_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(cluster)})
+		Expect(err).NotTo(HaveOccurred())
+		_, err = r.Reconcile(ctx, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(cluster)})
 		Expect(err).NotTo(HaveOccurred())
 
 		By("reading the config hash from the cluster ConfigMap")
@@ -270,6 +447,8 @@ var _ = Describe("ValkeyCluster config hash on first reconcile", func() {
 
 		By("reconciling with a client that cannot yet see the freshly created ConfigMap")
 		_, err := r.Reconcile(ctx, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(cluster)})
+		Expect(err).NotTo(HaveOccurred())
+		_, err = r.Reconcile(ctx, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(cluster)})
 		Expect(err).NotTo(HaveOccurred())
 
 		By("reading the config hash the operator persisted to the ConfigMap")
@@ -794,6 +973,10 @@ var _ = Describe("EventRecorder", func() {
 			defer func() { _ = k8sClient.Delete(ctx, cluster) }()
 
 			_, err := r.Reconcile(ctx, reconcile.Request{
+				NamespacedName: types.NamespacedName{Name: cluster.Name, Namespace: cluster.Namespace},
+			})
+			Expect(err).NotTo(HaveOccurred())
+			_, err = r.Reconcile(ctx, reconcile.Request{
 				NamespacedName: types.NamespacedName{Name: cluster.Name, Namespace: cluster.Namespace},
 			})
 			Expect(err).NotTo(HaveOccurred())
